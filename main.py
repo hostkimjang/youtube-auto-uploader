@@ -169,7 +169,7 @@ def wait_for_upload_start(browser, file_names, timeout=60):
     return False
 
 
-def monitor_and_upload(browser, status_file, upload_queue, max_wait_time=3600):
+def monitor_and_upload(browser, status_file, upload_queue, video_paths, max_wait_time=3600):
     start_time = time.time()
     upload_status = load_status(status_file)
     active_uploads = set()
@@ -211,9 +211,33 @@ def monitor_and_upload(browser, status_file, upload_queue, max_wait_time=3600):
                     print(f"{title}: 업로드 진행 중 - {status}")
                     active_uploads.add(title)
 
-            if not active_uploads and not upload_queue:
-                print("모든 파일 업로드 완료")
-                return True, []
+            # 새 파일 추가 및 업로드 시작 로직
+            if len(active_uploads) < MAX_CONCURRENT_UPLOADS:
+                new_files = get_pending_uploads(video_paths, status_file)
+                new_files = [f for f in new_files if os.path.basename(f) not in active_uploads]
+
+                if new_files:
+                    available_slots = MAX_CONCURRENT_UPLOADS - len(active_uploads)
+                    files_to_upload = []
+
+                    # 최소 MIN_UPLOAD_BATCH 개 이상의 파일이 있을 때만 업로드 시작
+                    if available_slots >= MIN_UPLOAD_BATCH and len(new_files) >= MIN_UPLOAD_BATCH:
+                        files_to_upload = new_files[:min(available_slots, len(new_files))]
+
+                        if upload_files(browser, files_to_upload):
+                            for file in files_to_upload:
+                                print(f"새 파일 업로드 시작: {os.path.basename(file)}")
+                                active_uploads.add(os.path.basename(file))
+                            upload_queue.extend(new_files[len(files_to_upload):])
+                        else:
+                            print("새 파일 업로드 실패")
+                    elif len(new_files) < MIN_UPLOAD_BATCH:
+                        print(f"남은 파일이 {MIN_UPLOAD_BATCH}개 미만입니다. 업로드를 중단합니다.")
+                        return True, []
+                else:
+                    print("더 이상 업로드할 파일이 없습니다.")
+                    if not active_uploads:
+                        return True, []
 
             time.sleep(5)
 
@@ -284,12 +308,11 @@ def upload_and_monitor(browser, video_paths, status_file):
             if upload_files(browser, initial_files):
                 initial_file_names = [os.path.basename(f) for f in initial_files]
                 if wait_for_upload_start(browser, initial_file_names):
-                    result, remaining_files = monitor_and_upload(browser, status_file, upload_queue)
+                    result, remaining_files = monitor_and_upload(browser, status_file, upload_queue, video_paths)
                     if result == "limit_reached":
                         print("일일 업로드 한도에 도달했습니다. 재시도를 준비합니다.")
                         retry_count += 1
-                        print(
-                            f"재시도 대기 중인 파일: {[os.path.basename(f) for f in get_pending_uploads(video_paths, status_file)]}")
+                        print(f"재시도 대기 중인 파일: {[os.path.basename(f) for f in get_pending_uploads(video_paths, status_file)]}")
                         wait_with_message(RETRY_DELAY, "일일 한도 도달로 인한 대기:")
                     elif result == True:
                         print("모든 파일 업로드 완료")
@@ -297,8 +320,7 @@ def upload_and_monitor(browser, video_paths, status_file):
                     else:
                         print("일부 파일 업로드 실패 또는 취소. 재시도를 준비합니다.")
                         retry_count += 1
-                        print(
-                            f"재시도 대기 중인 파일: {[os.path.basename(f) for f in get_pending_uploads(video_paths, status_file)]}")
+                        print(f"재시도 대기 중인 파일: {[os.path.basename(f) for f in get_pending_uploads(video_paths, status_file)]}")
                         wait_with_message(RETRY_DELAY, "실패 또는 취소로 인한 대기:")
                 else:
                     print("초기 파일 업로드 시작 실패. 재시도를 준비합니다.")
