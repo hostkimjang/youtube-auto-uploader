@@ -11,13 +11,18 @@ from selenium.webdriver.common.keys import Keys
 from selenium.common.exceptions import TimeoutException, StaleElementReferenceException
 import pprint
 from dotenv import load_dotenv
+from datetime import datetime, timedelta
+import threading
+
 
 video_dir_path = f''
 
 
 #최소 최초 동시업로드 2개 이상해야 현재 감지 로직 작동
-MAX_CONCURRENT_UPLOADS = 3
+MAX_CONCURRENT_UPLOADS = 10
 MIN_UPLOAD_BATCH = 2
+MAX_RETRIES = 10
+RETRY_DELAY = 3600 * 2
 
 def get_upload_list():
     video_extension = ['mp4', 'avi', 'mov', 'wmv', 'flv', 'mkv']
@@ -97,7 +102,6 @@ def save_status(status_file, status):
 
 def navigate_to_content_page(browser):
     try:
-        # '콘텐츠' 메뉴 항목 클릭
         content_menu = WebDriverWait(browser, 30).until(
             EC.element_to_be_clickable((By.CSS_SELECTOR, "#menu-paper-icon-item-1"))
         )
@@ -110,21 +114,21 @@ def navigate_to_content_page(browser):
 
 
 def upload_files(browser, file_paths):
+    if not file_paths:
+        print("업로드할 파일이 없습니다.")
+        return False
     try:
-        # '만들기' 버튼 클릭
         create_button = WebDriverWait(browser, 30).until(
             EC.element_to_be_clickable((By.CSS_SELECTOR, "#create-icon > ytcp-button-shape > button"))
         )
         create_button.click()
 
-        # '동영상 업로드' 옵션 선택
         upload_option = WebDriverWait(browser, 10).until(
             EC.element_to_be_clickable((By.CSS_SELECTOR,
                                         "#text-item-0 > ytcp-ve > tp-yt-paper-item-body > div > div > div > yt-formatted-string"))
         )
         upload_option.click()
 
-        # 파일 입력 요소 찾기 및 파일 경로 전송
         file_input = WebDriverWait(browser, 30).until(
             EC.presence_of_element_located((By.XPATH, "//input[@type='file']"))
         )
@@ -187,50 +191,31 @@ def monitor_and_upload(browser, status_file, upload_queue, max_wait_time=3600):
 
                 if "100% 업로드됨" in status or "처리 완료" in status:
                     print(f"{title}: 업로드 완료")
-                    upload_status[title] = True
+                    upload_status[title] = {"status": "completed", "timestamp": datetime.now().isoformat()}
                     completed_uploads.append(title)
                     active_uploads.discard(title)
                     status_changed = True
-                    # 각 파일 업로드 완료 시 상태 저장
                     save_status(status_file, upload_status)
                 elif "취소" in status or "실패" in status:
                     print(f"{title}: 업로드 {status}")
-                    upload_status[title] = False
+                    upload_status[title] = {"status": "failed", "timestamp": datetime.now().isoformat()}
                     active_uploads.discard(title)
                     status_changed = True
-                    # 업로드 실패 시에도 상태 저장
                     save_status(status_file, upload_status)
                 elif "일일 업로드 한도 도달" in status:
                     print(f"{title}: 일일 업로드 한도 도달")
-                    upload_status[title] = "limit_reached"
+                    upload_status[title] = {"status": "limit_reached", "timestamp": datetime.now().isoformat()}
                     save_status(status_file, upload_status)
-                    return "limit_reached"
+                    return "limit_reached", list(active_uploads) + list(upload_queue)
                 else:
                     print(f"{title}: 업로드 진행 중 - {status}")
                     active_uploads.add(title)
 
-            # 새로운 파일 업로드 시작
-            available_slots = MAX_CONCURRENT_UPLOADS - len(active_uploads)
-            if available_slots >= MIN_UPLOAD_BATCH and upload_queue and len(completed_uploads) > 0:
-                new_files = []
-                for _ in range(min(available_slots, MIN_UPLOAD_BATCH)):
-                    if upload_queue:
-                        new_file = upload_queue.popleft()
-                        new_files.append(new_file)
-                if new_files:
-                    if upload_files(browser, new_files):
-                        new_file_names = [os.path.basename(f) for f in new_files]
-                        if wait_for_upload_start(browser, new_file_names):
-                            active_uploads.update(new_file_names)
-                        else:
-                            print("새 파일 업로드 시작 실패")
-                            upload_queue.extendleft(reversed(new_files))
-
             if not active_uploads and not upload_queue:
                 print("모든 파일 업로드 완료")
-                return True
+                return True, []
 
-            time.sleep(3)
+            time.sleep(5)
 
         except TimeoutException:
             print("업로드 상태를 확인하는 데 실패했습니다.")
@@ -238,47 +223,102 @@ def monitor_and_upload(browser, status_file, upload_queue, max_wait_time=3600):
             print(f"예상치 못한 오류 발생: {str(e)}")
 
     print(f"{max_wait_time}초 동안 업로드가 완료되지 않았습니다.")
-    return False
+    return False, list(active_uploads) + list(upload_queue)
 
 
-def upload_and_monitor(browser, video_dir_paths, status_file, retry_delay=3600):
+def get_pending_uploads(video_paths, status_file):
     upload_status = load_status(status_file)
-    upload_queue = deque([path for path in video_dir_paths if
-                          os.path.basename(path) not in upload_status or not upload_status[os.path.basename(path)]])
+    return deque([
+        path for path in video_paths
+        if os.path.basename(path) not in upload_status or
+           upload_status[os.path.basename(path)].get("status") != "completed"
+    ])
+
+
+def wait_with_message(delay, message):
+    end_time = datetime.now() + timedelta(seconds=delay)
+    event = threading.Event()
+
+    def countdown():
+        while datetime.now() < end_time and not event.is_set():
+            remaining = (end_time - datetime.now()).total_seconds()
+            print(f"\r{message} {remaining:.0f}초 남음...", end="", flush=True)
+            event.wait(1)  # 1초마다 업데이트
+        print()  # 줄바꿈
+
+    thread = threading.Thread(target=countdown)
+    thread.start()
 
     try:
-        browser.get('https://studio.youtube.com/channel/')
-        if not navigate_to_content_page(browser):
-            print("'콘텐츠' 페이지로 이동 실패. 업로드를 중단합니다.")
-            return
+        event.wait(delay)
+    except KeyboardInterrupt:
+        print("\n대기가 중단되었습니다.")
+        event.set()
 
-        # 초기 업로드 시작
-        initial_upload_count = min(MAX_CONCURRENT_UPLOADS, len(upload_queue))
-        initial_files = [upload_queue.popleft() for _ in range(initial_upload_count)]
+    thread.join()
 
-        print("초기 업로드 파일:")
-        print(initial_files)
 
-        if upload_files(browser, initial_files):
-            initial_file_names = [os.path.basename(f) for f in initial_files]
-            if wait_for_upload_start(browser, initial_file_names):
-                result = monitor_and_upload(browser, status_file, upload_queue)
-                if result == "limit_reached":
-                    print(f"일일 업로드 한도에 도달했습니다. {retry_delay / 3600}시간 후 재시도합니다.")
-                    time.sleep(retry_delay)
-                    # 재시도 로직 추가 필요
-                elif result == True:
-                    print("모든 파일 업로드 완료")
+def upload_and_monitor(browser, video_paths, status_file):
+    retry_count = 0
+    while retry_count < MAX_RETRIES:
+        try:
+            upload_queue = get_pending_uploads(video_paths, status_file)
+
+            if len(upload_queue) < MIN_UPLOAD_BATCH:
+                print(f"업로드할 파일이 {MIN_UPLOAD_BATCH}개 미만입니다. 프로세스를 종료합니다.")
+                break
+
+            browser.get('https://studio.youtube.com/channel/')
+            if not navigate_to_content_page(browser):
+                print("'콘텐츠' 페이지로 이동 실패. 재시도합니다.")
+                retry_count += 1
+                wait_with_message(RETRY_DELAY, "재시도 대기 중:")
+                continue
+
+            initial_upload_count = max(MIN_UPLOAD_BATCH, min(MAX_CONCURRENT_UPLOADS, len(upload_queue)))
+            initial_files = [upload_queue.popleft() for _ in range(initial_upload_count)]
+
+            print("초기 업로드 파일:")
+            print([os.path.basename(f) for f in initial_files])
+
+            if upload_files(browser, initial_files):
+                initial_file_names = [os.path.basename(f) for f in initial_files]
+                if wait_for_upload_start(browser, initial_file_names):
+                    result, remaining_files = monitor_and_upload(browser, status_file, upload_queue)
+                    if result == "limit_reached":
+                        print("일일 업로드 한도에 도달했습니다. 재시도를 준비합니다.")
+                        retry_count += 1
+                        print(
+                            f"재시도 대기 중인 파일: {[os.path.basename(f) for f in get_pending_uploads(video_paths, status_file)]}")
+                        wait_with_message(RETRY_DELAY, "일일 한도 도달로 인한 대기:")
+                    elif result == True:
+                        print("모든 파일 업로드 완료")
+                        break
+                    else:
+                        print("일부 파일 업로드 실패 또는 취소. 재시도를 준비합니다.")
+                        retry_count += 1
+                        print(
+                            f"재시도 대기 중인 파일: {[os.path.basename(f) for f in get_pending_uploads(video_paths, status_file)]}")
+                        wait_with_message(RETRY_DELAY, "실패 또는 취소로 인한 대기:")
                 else:
-                    print("일부 파일 업로드 실패 또는 취소. 확인이 필요합니다.")
+                    print("초기 파일 업로드 시작 실패. 재시도를 준비합니다.")
+                    retry_count += 1
+                    upload_queue.extendleft(reversed(initial_files))
+                    wait_with_message(RETRY_DELAY, "업로드 시작 실패로 인한 대기:")
             else:
-                print("초기 파일 업로드 시작 실패")
-        else:
-            print("초기 파일 업로드 실패")
+                print("초기 파일 업로드 실패. 재시도를 준비합니다.")
+                retry_count += 1
+                upload_queue.extendleft(reversed(initial_files))
+                wait_with_message(RETRY_DELAY, "업로드 실패로 인한 대기:")
 
-    except Exception as e:
-        print(f"업로드 중 오류 발생: {str(e)}")
-        save_status(status_file, upload_status)
+        except Exception as e:
+            print(f"업로드 중 오류 발생: {str(e)}. 재시도를 준비합니다.")
+            retry_count += 1
+            if retry_count < MAX_RETRIES:
+                wait_with_message(RETRY_DELAY, "오류로 인한 대기:")
+
+    if retry_count == MAX_RETRIES:
+        print(f"최대 재시도 횟수({MAX_RETRIES})에 도달했습니다. 업로드를 중단합니다.")
 
 
 def run():
