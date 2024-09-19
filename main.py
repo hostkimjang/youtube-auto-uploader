@@ -8,11 +8,12 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.common.keys import Keys
-from selenium.common.exceptions import TimeoutException, StaleElementReferenceException
+from selenium.common.exceptions import TimeoutException, StaleElementReferenceException, WebDriverException
 import pprint
 from dotenv import load_dotenv
 from datetime import datetime, timedelta
 import threading
+import psutil
 
 
 video_dir_path = f''
@@ -169,7 +170,7 @@ def wait_for_upload_start(browser, file_names, timeout=60):
     return False
 
 
-def monitor_and_upload(browser, status_file, upload_queue, video_paths, max_wait_time=3600):
+def monitor_and_upload(browser, status_file, upload_queue, video_paths, max_wait_time=3600 * 999):
     start_time = time.time()
     upload_status = load_status(status_file)
     active_uploads = set()
@@ -190,26 +191,30 @@ def monitor_and_upload(browser, status_file, upload_queue, video_paths, max_wait
                 status = status_element.text
 
                 if "100% 업로드됨" in status or "처리 완료" in status:
-                    print(f"{title}: 업로드 완료")
-                    upload_status[title] = {"status": "completed", "timestamp": datetime.now().isoformat()}
-                    completed_uploads.append(title)
-                    active_uploads.discard(title)
-                    status_changed = True
-                    save_status(status_file, upload_status)
+                    if title not in upload_status or upload_status[title].get("status") != "completed":
+                        print(f"{title}: 업로드 완료")
+                        upload_status[title] = {"status": "completed", "timestamp": datetime.now().isoformat()}
+                        completed_uploads.append(title)
+                        active_uploads.discard(title)
+                        status_changed = True
                 elif "취소" in status or "실패" in status:
-                    print(f"{title}: 업로드 {status}")
-                    upload_status[title] = {"status": "failed", "timestamp": datetime.now().isoformat()}
-                    active_uploads.discard(title)
-                    status_changed = True
-                    save_status(status_file, upload_status)
+                    if title not in upload_status or upload_status[title].get("status") != "failed":
+                        print(f"{title}: 업로드 {status}")
+                        upload_status[title] = {"status": "failed", "timestamp": datetime.now().isoformat()}
+                        active_uploads.discard(title)
+                        status_changed = True
                 elif "일일 업로드 한도 도달" in status:
-                    print(f"{title}: 일일 업로드 한도 도달")
-                    upload_status[title] = {"status": "limit_reached", "timestamp": datetime.now().isoformat()}
-                    save_status(status_file, upload_status)
-                    return "limit_reached", list(active_uploads) + list(upload_queue)
+                    if title not in upload_status or upload_status[title].get("status") != "limit_reached":
+                        print(f"{title}: 일일 업로드 한도 도달")
+                        upload_status[title] = {"status": "limit_reached", "timestamp": datetime.now().isoformat()}
+                        save_status(status_file, upload_status)
+                        return "limit_reached", list(active_uploads) + list(upload_queue)
                 else:
                     print(f"{title}: 업로드 진행 중 - {status}")
                     active_uploads.add(title)
+
+            if status_changed:
+                save_status(status_file, upload_status)
 
             # 새 파일 추가 및 업로드 시작 로직
             if len(active_uploads) < MAX_CONCURRENT_UPLOADS:
@@ -343,21 +348,67 @@ def upload_and_monitor(browser, video_paths, status_file):
         print(f"최대 재시도 횟수({MAX_RETRIES})에 도달했습니다. 업로드를 중단합니다.")
 
 
+def close_existing_chrome_instances():
+    for proc in psutil.process_iter(['name']):
+        if proc.info['name'] == 'chrome.exe':
+            try:
+                proc.terminate()
+                proc.wait(timeout=5)
+            except psutil.NoSuchProcess:
+                pass
+            except psutil.TimeoutExpired:
+                proc.kill()
+
+
 def run():
     load_dotenv()
     id = os.getenv('id')
     pw = os.getenv('password')
     chromedriver_autoinstaller.install()
     pprint.pprint(chromedriver_autoinstaller.get_chrome_version())
+
+    # 기존 Chrome 인스턴스 종료
+    close_existing_chrome_instances()
+
     options = webdriver.ChromeOptions()
 
-    options.add_experimental_option('excludeSwitches', ['enable-logging'])
-    options.add_experimental_option('detach', True)
-    options.add_argument('user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36')
-    browser = webdriver.Chrome(options=options)
+    # 사용자 데이터 디렉토리 설정
+    user_data_dir = os.path.join(os.getcwd(), "chrome_user_data")
+    options.add_argument(f"user-data-dir={user_data_dir}")
 
-    youtube_login(browser, id, pw)
-    upload_and_monitor(browser, get_upload_list(), 'upload_status.json')
+    options.add_argument("--disable-infobars")
+    options.add_argument("--disable-popup-blocking")
+    options.add_argument("--ignore-certificate-errors")
+    options.add_argument("--disable-blink-features=AutomationControlled")
+
+    options.add_experimental_option('excludeSwitches', ['enable-logging'])
+    # 'detach' 옵션 제거
+    # options.add_experimental_option('detach', True)
+    options.add_argument(
+        'user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36')
+
+    try:
+        browser = webdriver.Chrome(options=options)
+    except WebDriverException as e:
+        print(f"Chrome 브라우저 시작 실패: {str(e)}")
+        return
+
+    try:
+        # 로그인 상태 확인
+        browser.get('https://www.youtube.com')
+        try:
+            WebDriverWait(browser, 10).until(EC.presence_of_element_located((By.ID, "avatar-btn")))
+            print("이미 로그인되어 있습니다.")
+        except:
+            print("로그인이 필요합니다.")
+            youtube_login(browser, id, pw)
+
+        upload_and_monitor(browser, get_upload_list(), 'upload_status.json')
+    finally:
+        # 작업 완료 후 브라우저 종료
+        browser.quit()
 
 if __name__ == '__main__':
-    run()
+    while True:
+        run()
+        time.sleep(60)
